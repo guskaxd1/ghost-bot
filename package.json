@@ -1,0 +1,25 @@
+{
+  "name": "ghost-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "axios": "^1.9.0",
+    "better-sqlite3": "^11.10.0",
+    "body-parser": "^2.2.0",
+    "discord.js": "^14.19.3",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "mercadopago": "^2.7.0",
+    "mongodb": "^6.18.0",
+    "mongoose": "^8.15.1",
+    "quick.db": "^9.1.7"
+  },
+  "description": ""
+}
