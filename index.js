@@ -11,10 +11,14 @@ const {
     ModalBuilder,
     TextInputBuilder,
     TextInputStyle,
+    MessageFlags,
+    AttachmentBuilder,
 } = require('discord.js');
-const { MongoClient, ObjectId } = require('mongodb');
-require('dotenv').config();
 
+const { MongoClient, ObjectId } = require('mongodb');
+const express = require('express');
+const { MercadoPagoConfig, Payment } = require('mercadopago');
+require('dotenv').config();
 // Definindo o client antes de usá-lo
 const client = new Client({
     intents: [
@@ -25,9 +29,18 @@ const client = new Client({
     ],
     partials: [Partials.Channel],
 });
+// --- Cliente do Express (da antiga API) ---
+const app = express();
+app.use(express.json());
+
+// --- Cliente do Mercado Pago (da antiga API) ---
+// ATENÇÃO: Renomeado para 'mpClient' para não conflitar com o 'client' do Discord
+const mpClient = new MercadoPagoConfig({
+    accessToken: process.env.MERCADOPAGO_ACCESS_TOKEN,
+});
 
 // IDs do servidor
-const GUILD_ID = '1403745828635414659';
+const GUILD_ID = '1403745828635414659'; 
 const CANAL_PAINEL_ID = '1403762758931185747';
 const CATEGORIA_PAGAMENTOS_ID = '1403834750568894626';
 const REGISTRADO_ROLE_ID = '1403759346797514824';
@@ -42,25 +55,39 @@ const EXCLUIDOS_ID = '1403800479250513992';
 const LOG_COUPONS_ID = '1403800214242066493';
 const CATEGORIA_EXPIRATIONS_ID = '1403837229247500380';
 
-// Dados do PIX
-const PIX_DATA = {
-    chave: 'ghostdelay01@gmail.com',
-    nome: 'Sebastião Vitor Santos da Silva',
-};
-
 // Conexão com MongoDB
 const mongoUri = process.env.MONGO_URI;
+// SUBSTITUA SEU BLOCO 'mongoClient' POR ESTE
+// SUBSTITUA SEU BLOCO 'mongoClient' POR ESTE
 const mongoClient = new MongoClient(mongoUri, {
     tls: true,
     tlsInsecure: process.env.MONGO_TLS_INSECURE === 'true',
-    serverSelectionTimeoutMS: 10000,
-    heartbeatFrequencyMS: 10000,
+    serverSelectionTimeoutMS: 60000, // Esta opção é válida e importante
+    socketTimeoutMS: 60000,          // Esta opção é válida e importante
     connectTimeoutMS: 30000,
+    heartbeatFrequencyMS: 30000,     // Esta opção é válida e importante
+    // As opções 'keepAlive' e 'keepAliveInitialDelay' foram removidas.
 });
+
+// ADICIONE ESTE BLOCO LOGO APÓS A CRIAÇÃO DO mongoClient
+mongoClient.on('close', () => {
+    console.warn('[MongoDB] A conexão com o MongoDB foi fechada. Tentando reconectar em 15 segundos...');
+    setTimeout(() => {
+        console.log('[MongoDB] Tentando reinicializar a conexão, coleções e Change Streams...');
+        // Chama a função que já existe para reconectar e reativar tudo
+        initializeCollections().catch(err => {
+            console.error('[MongoDB] Falha crítica na tentativa de reinicialização automática:', err);
+        });
+    }, 15000); // Tenta reconectar após 15 segundos
+});
+
 let db;
 
 // Mapa para armazenar a relação _id -> userId
 const userIdCache = new Map();
+
+// ADICIONE ESTA LINHA
+const activePaymentChannels = new Map(); // Mapa para UserId -> ChannelId
 
 // Mapa para armazenar o intervalo global de verificação
 const expirationCheckInterval = new Map();
@@ -399,11 +426,7 @@ async function setupRegisteredUsersChangeStream() {
                 return null;
             });
             if (!member) return;
-
-            const whatsappChannel = await guild.channels.fetch(CANAL_WHATSAPP_ID).catch(err => {
-                console.error('Erro ao buscar canal whatsapp:', err);
-                return null;
-            });
+            
             const excluidosChannel = await guild.channels.fetch(EXCLUIDOS_ID).catch(err => {
                 console.error('Erro ao buscar canal de excluídos:', err);
                 return null;
@@ -538,8 +561,12 @@ async function startExpirationCheck() {
     expirationCheckInterval.set('global', interval);
     console.log('Intervalo de verificação global iniciado (1 hora)');
 
-    // Executar a verificação imediatamente na inicialização
-    await checkAllExpirations();
+    // Agendar a primeira verificação para 1 minuto após a inicialização
+    console.log('A primeira verificação de expirações foi agendada para daqui a 1 minuto para não sobrecarregar a inicialização.');
+    setTimeout(async () => {
+        console.log(`[Agendado] Executando a primeira verificação de expirações...`);
+        await checkAllExpirations();
+    }, 60 * 1000); // Atraso de 1 minuto (60000 ms)
 }
 
 // Função auxiliar para verificar expiração imediatamente
@@ -609,8 +636,6 @@ async function checkExpirationNow(userId, expirationDate) {
                     embeds: [notifyEmbed],
                 });
                 await notificationSent.insertOne({ userId, type: '3days', notifiedAt: new Date() });
-                console.log(`Notificação de 3 dias enviada para ${userId} no canal privado ${channelName}`);
-
                 setTimeout(async () => {
                     try {
                         if (expirationChannel) {
@@ -684,8 +709,6 @@ async function checkExpirationNow(userId, expirationDate) {
                     embeds: [notifyEmbed],
                 });
                 await notificationSent.insertOne({ userId, type: '1day', notifiedAt: new Date() });
-                console.log(`Notificação de 1 dia enviada para ${userId} no canal privado ${channelName}`);
-
                 setTimeout(async () => {
                     try {
                         if (expirationChannel) {
@@ -721,8 +744,60 @@ async function checkExpirationNow(userId, expirationDate) {
     }
 
     // Notificação de expiração
-    if (daysLeft <= 0) {
-        console.log(`[Debug] Condição de expiração atendida para ${userId}, daysLeft: ${daysLeft}`);
+        if (daysLeft <= 0) {
+            console.log(`[Debug] Assinatura de ${userId} expirada. Verificando saldo para renovação automática...`);
+            
+            // Define o custo do plano
+            const CUSTO_PLANO_MENSAL = 300; 
+        
+            // Busca o saldo do usuário
+            const balanceDoc = await userBalances.findOne({ userId });
+            const saldoDisponivel = balanceDoc ? balanceDoc.balance : 0;
+        
+            // VERIFICA SE O SALDO É SUFICIENTE
+            if (saldoDisponivel >= CUSTO_PLANO_MENSAL) {
+                console.log(`[Auto-Renovação] Saldo suficiente (R$ ${saldoDisponivel}) para ${userId}. Renovando...`);
+                try {
+                    // 1. Deduzir o saldo do usuário
+                    await userBalances.updateOne({ userId }, { $inc: { balance: -CUSTO_PLANO_MENSAL } });
+        
+                    // 2. Renovar a assinatura por mais 30 dias a partir de AGORA
+                    const newExpirationDate = new Date();
+                    newExpirationDate.setDate(newExpirationDate.getDate() + 30);
+                    await expirationDates.updateOne({ userId }, { $set: { expirationDate: newExpirationDate } });
+                    
+                    // 3. (Opcional, mas recomendado) Enviar um log para os administradores
+                    const logChannel = await guild.channels.fetch(LOGS_BOTS_ID);
+                    if (logChannel) {
+                        const logEmbed = new EmbedBuilder()
+                            .setTitle('🔄 Assinatura Renovada Automaticamente')
+                            .setDescription(`A assinatura de <@${userId}> foi renovada usando o saldo de bônus.`)
+                            .setColor('#00BFFF')
+                            .addFields(
+                                { name: '💰 Saldo Utilizado', value: `R$ ${CUSTO_PLANO_MENSAL.toFixed(2)}` },
+                                { name: '🗓️ Nova Expiração', value: newExpirationDate.toLocaleDateString('pt-BR') }
+                            )
+                            .setTimestamp();
+                        await logChannel.send({ embeds: [logEmbed] });
+                    }
+                    // 4. Notificar o usuário via DM
+                    await member.send({
+                        embeds: [
+                            new EmbedBuilder()
+                                .setTitle('✅ Assinatura Renovada!')
+                                .setDescription(`Olá! Sua assinatura VIP acabou de ser renovada automaticamente por mais 30 dias utilizando seu saldo de bônus.`)
+                                .setColor('#00FF00')
+                                .setTimestamp()
+                        ]
+                    }).catch(err => console.error(`Falha ao enviar DM de auto-renovação para ${userId}:`, err));
+                    // Limpa as notificações de expiração para o próximo ciclo
+                     await notificationSent.deleteMany({ userId });
+                } catch (err) {
+                    console.error(`[Auto-Renovação] Erro crítico ao renovar para ${userId}:`, err);
+                    // Se falhar, talvez seja melhor proceder com a expiração normal
+                }
+            } else {
+            console.log(`[Expiração] Saldo insuficiente para ${userId}. Procedendo com a remoção do VIP.`);
         try {
             const botMember = await guild.members.fetch(client.user.id);
             const botHighestRole = botMember.roles.highest;
@@ -779,8 +854,6 @@ async function checkExpirationNow(userId, expirationDate) {
                 content: `<@${userId}>`,
                 embeds: [expireEmbed],
             });
-            console.log(`Notificação de expiração enviada para ${userId} no canal privado ${channelName}`);
-
             setTimeout(async () => {
                 try {
                     if (expirationChannel) {
@@ -818,11 +891,319 @@ async function checkExpirationNow(userId, expirationDate) {
 
         await expirationDates.deleteOne({ userId });
         await notificationSent.deleteMany({ userId });
+        }
+    }
+}
+// =================================================================================
+// ROTAS DA API (DO ANTIGO server.js)
+// =================================================================================
+
+app.get('/', (req, res) => {
+    res.status(200).send('API e da Comunidade Ghost Services estão online e funcionando!');
+});
+
+async function createMercadoPagoPayment(userId, valor, duration, saldoUtilizado = 0) { // <--- A CORREÇÃO ESTÁ AQUI
+    console.log(`[PaymentFunc] Iniciando pagamento para userId: ${userId}, valor: ${valor}, saldo usado: ${saldoUtilizado}`);
+    try {
+        const paymentData = {
+            transaction_amount: Number(valor),
+            description: `Taxa de acesso (${duration} dias)`,
+            payment_method_id: 'pix',
+            payer: { email: `user-${userId}@ghost.services`},
+            external_reference: userId,
+            notification_url: `${process.env.APP_URL}/webhook-mercadopago`,
+            metadata: {
+                balance_used: saldoUtilizado
+            }
+        };
+
+        const payment = new Payment(mpClient);
+
+        console.log('[PaymentFunc] [ETAPA 1/3] Preparando para enviar requisição para a API do Mercado Pago...');
+        
+        const result = await payment.create({ body: paymentData });
+        
+        console.log('[PaymentFunc] [ETAPA 2/3] Resposta recebida da API do Mercado Pago com sucesso.');
+        
+        const paymentInfo = {
+            paymentId: result.id,
+            qrCodeBase64: result.point_of_interaction.transaction_data.qr_code_base64,
+            copiaECola: result.point_of_interaction.transaction_data.qr_code
+        };
+
+        console.log('[PaymentFunc] [ETAPA 3/3] Pagamento processado e dados retornados.');
+        return paymentInfo;
+
+    } catch (error) {
+        console.error('[PaymentFunc] ERRO CRÍTICO ao se comunicar com a API do Mercado Pago.');
+        console.error('Detalhes completos do erro:', error);
+        
+        throw new Error('Falha ao se comunicar com a API de pagamentos.');
     }
 }
 
+// Rota da API agora chama a função diretamente
+app.post('/create-payment', async (req, res) => {
+    console.log('[API] Rota /create-payment foi chamada com o corpo:', req.body);
+    try {
+        const { userId, valor, duration } = req.body;
+        if (!userId || !valor || !duration) {
+            return res.status(400).json({ error: 'Dados insuficientes.' });
+        }
+
+        // Chama a nova função
+        const paymentInfo = await createMercadoPagoPayment(userId, valor, duration);
+        
+        res.json(paymentInfo);
+
+    } catch (error) {
+        console.error('[API] Erro na rota /create-payment:', error.message);
+        res.status(500).json({ error: 'Falha ao criar pagamento.' });
+    }
+});
+
+// Substitua toda a sua rota de webhook por esta
+app.post('/webhook-mercadopago', async (req, res) => {
+    const { query } = req;
+    console.log('[API] Webhook recebido:', query);
+
+    // Responde imediatamente ao Mercado Pago para evitar timeouts e reenvios
+    res.sendStatus(200);
+
+    if (!query || !query['data.id']) {
+        console.log('[Webhook] Query inválida ou sem data.id. Ignorando.');
+        return;
+    }
+
+    if (query.type === 'payment') {
+        try {
+            const payment = new Payment(mpClient);
+            const paymentDetails = await payment.get({ id: query['data.id'] });
+            
+            if (paymentDetails.status === 'approved') {
+                const userId = paymentDetails.external_reference;
+                const valorPago = paymentDetails.transaction_amount;
+                const now = new Date();
+                const paymentReference = `MP-${paymentDetails.id}`; // ID único do pagamento
+                const balanceUsed = paymentDetails.metadata?.balance_used;
+                const horarioFormatado = now.toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+
+                const alreadyProcessed = await registeredUsers.findOne({ userId: userId, 'paymentHistory.reference': paymentReference });
+                if (alreadyProcessed) {
+                    console.log(`[Webhook] Pagamento ${paymentReference} já processado. Ignorando.`);
+                    return;
+                }
+
+                const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+                if (!guild) {
+                    console.error('[Webhook] Não foi possível encontrar o servidor (GUILD). Abortando.');
+                    return;
+                }
+    
+                const member = await guild.members.fetch(userId).catch(() => null);
+                if (!member) {
+                    console.error(`[Webhook] Não foi possível encontrar o membro com ID ${userId} no servidor. Abortando.`);
+                    return;
+                }
+
+                // 1. Verificamos se o pagamento é o mensal (R$ 300)
+                if (Number(valorPago) === 300) {
+                    console.log(`[Bônus] Pagamento de R$ 300 detectado para ${userId}. Verificando indicação...`);
+
+                    // 2. Buscamos os dados do usuário que pagou para ver se ele foi indicado
+                    const payingUser = await registeredUsers.findOne({ userId: userId });
+
+                    // 3. Checamos as condições:
+                    //    - Ele foi indicado por alguém (o campo 'referredBy' existe)?
+                    //    - O bônus para esta indicação ainda não foi pago?
+                    //    - (NOVA CONDIÇÃO) O histórico de pagamentos dele está vazio?
+                    if (payingUser && payingUser.referredBy && !payingUser.referralBonusPaid && (!payingUser.paymentHistory || payingUser.paymentHistory.length === 0)) {
+                        const referrerId = payingUser.referredBy;
+                        console.log(`[Bônus] Usuário NOVO ${userId} foi indicado por ${referrerId}. Processando bônus.`);
+
+                        try {
+                            // 4. Adiciona R$ 50 ao saldo do indicador
+                            await userBalances.updateOne(
+                                { userId: referrerId },
+                                { $inc: { balance: 50 } },
+                                { upsert: true } // Cria o documento de saldo se ele não existir
+                            );
+
+                            // 5. Marca que o bônus foi pago para não pagar de novo
+                            await registeredUsers.updateOne(
+                                { userId: userId },
+                                { $set: { referralBonusPaid: true } }
+                            );
+
+                            console.log(`[Bônus] R$ 50 creditados com sucesso para ${referrerId}.`);
+
+                            // (Opcional, mas recomendado) Enviar um log para um canal
+                            const logChannel = await guild.channels.fetch(LOGS_BOTS_ID);
+                            const referrerMember = await guild.members.fetch(referrerId).catch(() => null);
+                            const payingMember = await guild.members.fetch(userId).catch(() => null);
+
+                            if (logChannel) {
+                                const bonusEmbed = new EmbedBuilder()
+                                    .setTitle('💸 Bônus de Indicação Creditado')
+                                    .setDescription(`Um bônus de indicação foi pago com sucesso para um **novo assinante**!`)
+                                    .setColor('#FFD700')
+                                    .addFields(
+                                        { name: 'Indicador (Recebeu o Bônus)', value: `${referrerMember ? referrerMember.user.tag : `ID: ${referrerId}`}`, inline: false },
+                                        { name: 'Novo Assinante (Gerou o Bônus)', value: `${payingMember ? payingMember.user.tag : `ID: ${userId}`}`, inline: false },
+                                        { name: '💰 Valor do Bônus', value: '`R$ 50,00`', inline: true },
+                                        { name: '✅ Status', value: '`Creditado`', inline: true }
+                                    )
+                                    .setTimestamp();
+                                await logChannel.send({ embeds: [bonusEmbed] });
+                            }
+
+                        } catch (err) {
+                            console.error(`[Bônus] Falha crítica ao processar o bônus para o indicador ${referrerId}:`, err);
+                        }
+                    } else {
+                        console.log(`[Bônus] Nenhuma indicação válida, bônus já pago ou usuário não é novo. Nenhuma ação para ${userId}.`);
+                    }
+                }
+                const duration = (Number(valorPago) === 100 || (balanceUsed && Number(valorPago) + Number(balanceUsed) === 100)) ? 7 : 30;
+    
+                let newExpirationDate;
+                const existingExpiration = await expirationDates.findOne({ userId });
+
+                if (existingExpiration && new Date(existingExpiration.expirationDate) > now) {
+                    newExpirationDate = new Date(existingExpiration.expirationDate);
+                } else {
+                    newExpirationDate = new Date(now);
+                }
+                
+                newExpirationDate.setDate(newExpirationDate.getDate() + duration);
+                
+                await expirationDates.updateOne({ userId }, { $set: { expirationDate: newExpirationDate } }, { upsert: true });
+                await registeredUsers.updateOne({ userId }, { $push: { paymentHistory: { amount: valorPago, timestamp: now, reference: paymentReference } } });
+                
+                try {
+                    const guild = await client.guilds.fetch(GUILD_ID);
+                    const member = await guild.members.fetch(userId);
+    
+                    if (member) {
+                        await member.roles.add(VIP_ROLE_ID);
+                        await member.roles.remove(AGUARDANDO_PAGAMENTO_ROLE_ID);
+                        console.log(`[Webhook Fallback] Cargos VIP adicionados diretamente para o usuário ${userId}.`);
+                    }
+                } catch (roleError) {
+                    console.error(`[Webhook Fallback] Erro ao tentar aplicar cargos diretamente para ${userId}:`, roleError);
+                    // Mesmo que isso falhe, o Change Stream ainda pode funcionar se estiver online.
+                }
+
+                // --- LÓGICA DE CONFIRMAÇÃO NO CANAL (AGORA CONDICIONAL) ---
+                const confirmationEmbed = new EmbedBuilder()
+                    .setTitle('✅ Pagamento Confirmado e Assinatura Ativada!')
+                    .setColor('#00FF00')
+                    .setTimestamp()
+                    .setFooter({ text: 'Agradecemos a sua preferência!' });
+                if (balanceUsed && balanceUsed > 0) {
+                    // MENSAGEM PARA PAGAMENTO COM DESCONTO
+                    confirmationEmbed
+                        .setDescription(`Pagamento processado com sucesso utilizando seu saldo de bônus!`)
+                        .addFields(
+                            { name: '💰 Saldo Utilizado', value: `R$ ${Number(balanceUsed).toFixed(2)}`, inline: true },
+                            { name: '💸 Valor Pago (PIX)', value: `R$ ${valorPago.toFixed(2)}`, inline: true },
+                            { name: '⏳ Duração Adicionada', value: `${duration} dias` },
+                            { name: '🗓️ Assinatura Expira em', value: newExpirationDate.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' }) },
+                            { name: '🚀 Acesso Liberado', value: 'Seu cargo VIP já foi atualizado!' }
+                        );
+                } else {
+                    // MENSAGEM PARA PAGAMENTO NORMAL (SEM DESCONTO)
+                    confirmationEmbed
+                        .setDescription(`O pagamento de ${member.user.username} foi processado com sucesso!`)
+                        .addFields(
+                            { name: '💸 Valor Pago', value: `R$ ${valorPago.toFixed(2)}`, inline: true },
+                            { name: '⏳ Duração Adicionada', value: `${duration} dias`, inline: true },
+                            { name: '🗓️ Assinatura Expira em', value: newExpirationDate.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' }) },
+                            { name: '🚀 Acesso Liberado', value: 'Seu cargo VIP já foi atualizado!' }
+                        );
+                }
+                
+                const channelRecord = await activePixChannels.findOne({ userId: userId });
+                const channelId = channelRecord ? channelRecord.channelId : null;
+                if (channelId) {
+                    try {
+                        const paymentChannel = await guild.channels.fetch(channelId);
+                        await paymentChannel.send({ content: `<@${userId}>`, embeds: [confirmationEmbed] });
+                        await activePixChannels.deleteOne({ userId: userId });
+                    } catch (channelError) {
+                        await member.send({ embeds: [confirmationEmbed] }).catch(dmError => console.error('Falha ao enviar DM de fallback.', dmError));
+                    }
+                } else {
+                    await member.send({ embeds: [confirmationEmbed] }).catch(dmError => console.error('Falha ao enviar DM.', dmError));
+                }
+                // --- LÓGICA DE LOGS ---
+                try {
+                    const logBotChannel = await guild.channels.fetch(LOG_PAGAMENTOS_ID);
+                    const embedPagamentoAprovado = new EmbedBuilder()
+                        .setTitle('💰 Pagamento Aprovado')
+                        .setDescription('Um novo pagamento foi aprovado!')
+                        .setColor('#00FF00')
+                        .addFields(
+                            { name: '👤 Usuário', value: `\`${member.user.username} (ID: ${userId})\`` },
+                            { name: '💸 Valor', value: `\`R$${valorPago.toFixed(2)}\``, inline: true },
+                            { name: '📝 Referência', value: `\`${paymentDetails.id}\``, inline: true },
+                            { name: '⏳ Duração', value: `\`${duration} dias\``, inline: true },
+                            { name: '🕒 Horário', value: `\`${horarioFormatado}\`` }
+                        )
+                        .setTimestamp();
+                    await logBotChannel.send({ embeds: [embedPagamentoAprovado] });
+                } catch (err) {
+                    console.error("Erro ao enviar log para LOG_PAGAMENTOS_ID:", err);
+                }
+                if (balanceUsed && balanceUsed > 0) {
+                try {
+                    await userBalances.updateOne({ userId: userId }, { $inc: { balance: -balanceUsed } });
+                    console.log(`[Webhook] Saldo deduzido: R$ ${Number(balanceUsed).toFixed(2)} para ${userId}.`);
+                    
+                    const logChannel = await guild.channels.fetch(LOGS_BOTS_ID);
+                    const renewalWithBalanceEmbed = new EmbedBuilder()
+                        .setTitle('💳 Assinatura Renovada com Saldo')
+                        .setDescription(`A assinatura de <@${userId}> foi renovada utilizando o saldo de bônus.`)
+                        .setColor('#FFC300')
+                        .addFields(
+                            { name: '👤 Usuário', value: `<@${userId}> (ID: ${userId})` },
+                            { name: '💰 Saldo Utilizado', value: `R$ ${Number(balanceUsed).toFixed(2)}`, inline: true },
+                            { name: '💸 Valor Pago (PIX)', value: `R$ ${valorPago.toFixed(2)}`, inline: true }
+                        )
+                        .setTimestamp();
+                    await logChannel.send({ embeds: [renewalWithBalanceEmbed] });
+                } catch (err) {
+                    console.error(`[Webhook] ERRO ao deduzir saldo ou logar para ${userId}:`, err);
+                }
+            } else {
+                // Log para renovação SEM saldo
+                try {
+                    const logPagamentosChannel = await guild.channels.fetch(LOGS_BOTS_ID);
+                    const embedAssinaturaRenovada = new EmbedBuilder()
+                        .setTitle('🔄 Assinatura Renovada')
+                        .setDescription('A assinatura de um usuário foi renovada!')
+                        .setColor('#00BFFF')
+                        .addFields(
+                            { name: '👤 Usuário', value: `\`${member.user.username}\`` },
+                            { name: '🆔 ID', value: `\`${userId}\``, inline: true },
+                            { name: '🕒 Horário', value: `\`${horarioFormatado}\``, inline: true },
+                            { name: '✅ Papéis Atualizados', value: '`Sim`', inline: true }
+                        )
+                        .setTimestamp();
+                    await logPagamentosChannel.send({ embeds: [embedAssinaturaRenovada] });
+                } catch (err) {
+                    console.error("Erro ao enviar log de renovação genérico para LOGS_BOTS_ID:", err);
+                }
+            }
+        }
+    }catch (error) {
+        console.error('[API] Erro CRÍTICO ao processar webhook do Mercado Pago:', error);
+    }
+}
+});
+
 // Quando o bot estiver online
-client.once('ready', async () => {
+client.once('clientReady', async () => {
     console.log(`✅ Bot online como ${client.user.tag}`);
 
     const guild = await client.guilds.fetch(GUILD_ID);
@@ -873,7 +1254,7 @@ client.once('ready', async () => {
             `Clique nos botões abaixo para gerenciar sua conta:\n\n` +
             `📌 Como funciona?\n\nClique no botão abaixo para adicionar saldo à sua conta.\n\n` +
             `⚠️ Importante!\n\nAntes de fazer qualquer pagamento, lembre-se de que não há reembolsos para adição de créditos. \n\n` +
-            `💰 Valores\n\nPara ativar sua assinatura pela primeira vez, você precisa ter pelo menos R$ 299,00 de saldo.\n\n` +
+            `💰 Valores\n\nPara ativar sua assinatura pela primeira vez, você precisa ter pelo menos R$ 100,00 ou R$ 300,00 de saldo.\n\n` +
             `💡 *Se você não estiver registrado, clique em **#registrar-se** primeiro.*`
         )
         .setColor('#FFD700');
@@ -919,7 +1300,7 @@ client.on('interactionCreate', async (interaction) => {
         try {
             await interaction.reply({
                 content: '❌ Ocorreu um erro interno. Tente novamente mais tarde.',
-                ephemeral: true,
+                flags: [MessageFlags.Ephemeral] 
             });
         } catch (err) {
             console.error('Erro ao responder interação de coleções não inicializadas:', err);
@@ -956,115 +1337,115 @@ client.on('interactionCreate', async (interaction) => {
 
     // Formulário de registro enviado
     if (interaction.isModalSubmit() && interaction.customId === 'formulario_registro') {
+    await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+    try {
+        const nome = interaction.fields.getTextInputValue('nome');
+        const whatsapp = interaction.fields.getTextInputValue('whatsapp');
+
+        const phoneRegex = /^\d{2}9\d{8}$/;
+        if (!phoneRegex.test(whatsapp)) {
+            // CORRIGIDO: Usando editReply
+            await interaction.editReply({
+                content: '❌ Número inválido! Use o formato brasileiro: DDD900000000 (ex: 11912345678).',
+            });
+            return;
+        }
+
+        const existingUser = await registeredUsers.findOne({ userId: interaction.user.id });
+        if (existingUser) {
+            // CORRIGIDO: Usando editReply
+            await interaction.editReply({
+                content: '❌ Você já está registrado!',
+            });
+            return;
+        }
+
+        const result = await registeredUsers.insertOne({
+            userId: interaction.user.id,
+            name: nome,
+            whatsapp: whatsapp,
+            registeredAt: new Date(),
+            paymentHistory: []
+        });
+        const docId = result.insertedId.toString();
+        userIdCache.set(docId, interaction.user.id);
+
+        await userBalances.updateOne(
+            { userId: interaction.user.id },
+            { $set: { balance: 0 } },
+            { upsert: true }
+        );
+        console.log(`Novo usuário registrado: ${nome}, para o ID ${interaction.user.id}`);
+
+        let roleUpdateSuccess = false;
         try {
-            const nome = interaction.fields.getTextInputValue('nome');
-            const whatsapp = interaction.fields.getTextInputValue('whatsapp');
+            const member = await interaction.guild.members.fetch(interaction.user.id);
+            const botMember = await interaction.guild.members.fetch(client.user.id);
+            const botRoles = botMember.roles.cache.map(r => ({ id: r.id, name: r.name, position: r.position }));
+            const highestBotRole = botRoles.reduce((max, role) => role.position > max.position ? role : max, { position: -1 });
+            const registeredRole = await interaction.guild.roles.fetch(REGISTRADO_ROLE_ID);
+            const userRoles = member.roles.cache.map(r => ({ id: r.id, name: r.name, position: r.position }));
 
-            const phoneRegex = /^\d{2}9\d{8}$/;
-            if (!phoneRegex.test(whatsapp)) {
-                await interaction.reply({
-                    content: '❌ Número inválido! Use o formato brasileiro: DDD900000000 (ex: 11912345678).',
-                    ephemeral: true,
-                });
-                return;
+            if (highestBotRole.position <= (registeredRole?.position || 0)) {
+                throw new Error('Bot não tem permissão suficiente para atribuir o cargo de registrado devido à hierarquia de papéis.');
             }
 
-            const existingUser = await registeredUsers.findOne({ userId: interaction.user.id });
-            if (existingUser) {
-                await interaction.reply({
-                    content: '❌ Você já está registrado!',
-                    ephemeral: true,
-                });
-                return;
+            const highestUserRole = userRoles.reduce((max, role) => role.position > max.position ? role : max, { position: -1 });
+            if (highestUserRole.position >= highestBotRole.position) {
+                throw new Error('Bot não pode gerenciar os papéis deste usuário devido a um cargo superior.');
             }
 
-            const result = await registeredUsers.insertOne({
-                userId: interaction.user.id,
-                name: nome,
-                whatsapp: whatsapp,
-                registeredAt: new Date(),
-                paymentHistory: []
-            });
-            const docId = result.insertedId.toString();
-            userIdCache.set(docId, interaction.user.id);
-
-            await userBalances.updateOne(
-                { userId: interaction.user.id },
-                { $set: { balance: 0 } },
-                { upsert: true }
-            );
-            console.log(`Novo usuário registrado: ${nome}, para o ID ${interaction.user.id}`);
-
-            let roleUpdateSuccess = false;
-            try {
-                const member = await interaction.guild.members.fetch(interaction.user.id);
-                const botMember = await interaction.guild.members.fetch(client.user.id);
-                const botRoles = botMember.roles.cache.map(r => ({ id: r.id, name: r.name, position: r.position }));
-                const highestBotRole = botRoles.reduce((max, role) => role.position > max.position ? role : max, { position: -1 });
-                const registeredRole = await interaction.guild.roles.fetch(REGISTRADO_ROLE_ID);
-                const userRoles = member.roles.cache.map(r => ({ id: r.id, name: r.name, position: r.position }));
-
-                if (highestBotRole.position <= (registeredRole?.position || 0)) {
-                    throw new Error('Bot não tem permissão suficiente para atribuir o cargo de registrado devido à hierarquia de papéis.');
-                }
-
-                const highestUserRole = userRoles.reduce((max, role) => role.position > max.position ? role : max, { position: -1 });
-                if (highestUserRole.position >= highestBotRole.position) {
-                    throw new Error('Bot não pode gerenciar os papéis deste usuário devido a um cargo superior.');
-                }
-
-                await member.roles.add(REGISTRADO_ROLE_ID);
-                console.log(`Papel ${REGISTRADO_ROLE_ID} adicionado ao usuário ${interaction.user.id}`);
-                roleUpdateSuccess = true;
-            } catch (roleError) {
-                console.error(`Erro ao adicionar o cargo ${REGISTRADO_ROLE_ID} ao usuário ${interaction.user.id}:`, roleError);
-                const logChannel = await interaction.guild.channels.fetch(LOGS_BOTS_ID);
-                if (logChannel) {
-                    const errorEmbed = new EmbedBuilder()
-                        .setTitle('⚠️ Erro ao Atribuir Cargo de Registro')
-                        .setDescription(`Falha ao adicionar o cargo de registrado para <@${interaction.user.id}> durante o registro.`)
-                        .addFields([
-                            { name: 'Usuário', value: `${interaction.user.tag} (ID: ${interaction.user.id})`, inline: false },
-                            { name: 'Erro', value: roleError.message, inline: false },
-                        ])
-                        .setColor('#FF0000')
-                        .setTimestamp();
-                    await logChannel.send({ embeds: [errorEmbed], content: `<@${ADMIN_USER_ID}>` });
-                }
-                throw new Error('Falha ao adicionar o cargo de registrado. Um administrador foi notificado.');
-            }
-
-            const whatsappChannel = await interaction.guild.channels.fetch(CANAL_WHATSAPP_ID);
-            if (whatsappChannel) {
-                const currentTime = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', hour12: false }).replace(', ', ' às ');
-                const registrationEmbed = new EmbedBuilder()
-                    .setTitle('📝 Novo Registro')
+            await member.roles.add(REGISTRADO_ROLE_ID);
+            console.log(`Papel ${REGISTRADO_ROLE_ID} adicionado ao usuário ${interaction.user.id}`);
+            roleUpdateSuccess = true;
+        } catch (roleError) {
+            console.error(`Erro ao adicionar o cargo ${REGISTRADO_ROLE_ID} ao usuário ${interaction.user.id}:`, roleError);
+            const logChannel = await interaction.guild.channels.fetch(LOGS_BOTS_ID);
+            if (logChannel) {
+                const errorEmbed = new EmbedBuilder()
+                    .setTitle('⚠️ Erro ao Atribuir Cargo de Registro')
+                    .setDescription(`Falha ao adicionar o cargo de registrado para <@${interaction.user.id}> durante o registro.`)
                     .addFields([
-                        { name: 'Nome', value: nome, inline: true },
-                        { name: 'Número', value: whatsapp, inline: true },
+                        { name: 'Usuário', value: `${interaction.user.tag} (ID: ${interaction.user.id})`, inline: false },
+                        { name: 'Erro', value: roleError.message, inline: false },
                     ])
-                    .setFooter({ text: `Hoje às ${currentTime}` })
-                    .setColor('#00BFFF')
+                    .setColor('#FF0000')
                     .setTimestamp();
-                await whatsappChannel.send({ embeds: [registrationEmbed] });
+                await logChannel.send({ embeds: [errorEmbed] });
             }
+            throw new Error('Falha ao adicionar o cargo de registrado. Um administrador foi notificado.');
+        }
 
-            await interaction.reply({
-                content: `✅ Obrigado, ${nome}! Você foi registrado com sucesso. Seu saldo inicial é R$0.00.${roleUpdateSuccess ? '' : ' ⚠️ Porém, houve um erro ao atribuir seu cargo. Um administrador foi notificado.'}`,
-                ephemeral: true,
+        const whatsappChannel = await interaction.guild.channels.fetch(CANAL_WHATSAPP_ID);
+        if (whatsappChannel) {
+            const currentTime = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', hour12: false }).replace(', ', ' às ');
+            const registrationEmbed = new EmbedBuilder()
+                .setTitle('📝 Novo Registro')
+                .addFields([
+                    { name: 'Nome', value: nome, inline: true },
+                    { name: 'Número', value: whatsapp, inline: true },
+                ])
+                .setFooter({ text: `Hoje às ${currentTime}` })
+                .setColor('#00BFFF')
+                .setTimestamp();
+            await whatsappChannel.send({ embeds: [registrationEmbed] });
+        }
+
+        await interaction.editReply({
+            content: `✅ Obrigado, ${nome}! Você foi registrado com sucesso. Seu saldo inicial é R$0.00.${roleUpdateSuccess ? '' : ' ⚠️ Porém, houve um erro ao atribuir seu cargo. Um administrador foi notificado.'}`,
+        });
+    } catch (err) {
+        console.error('Erro ao processar o formulário:', err);
+        try {
+            // CORRIGIDO: Usando editReply
+            await interaction.editReply({
+                content: `❌ Ocorreu um erro ao processar seu registro: ${err.message}`,
             });
-        } catch (err) {
-            console.error('Erro ao processar o formulário:', err);
-            try {
-                await interaction.reply({
-                    content: `❌ Ocorreu um erro ao processar seu registro: ${err.message}`,
-                    ephemeral: true,
-                });
-            } catch (replyErr) {
-                console.error('Erro ao responder interação de formulário:', replyErr);
-            }
+        } catch (replyErr) {
+            console.error('Erro ao responder interação de formulário:', replyErr);
         }
     }
+}
 
     // Botão de adicionar saldo
     if (interaction.isButton() && interaction.customId === 'adicionar_saldo') {
@@ -1073,24 +1454,9 @@ client.on('interactionCreate', async (interaction) => {
             if (!userExists) {
                 await interaction.reply({
                     content: '❌ Você precisa se registrar antes de adicionar saldo. Vá até **#registrar-se**.',
-                    ephemeral: true,
+                    flags: [MessageFlags.Ephemeral]
                 });
                 return;
-            }
-
-            const activeChannel = await activePixChannels.findOne({ userId: interaction.user.id });
-            if (activeChannel) {
-                const channelExists = await interaction.guild.channels.fetch(activeChannel.channelId).catch(() => null);
-                if (!channelExists) {
-                    await activePixChannels.deleteOne({ userId: interaction.user.id });
-                    await paymentValues.deleteOne({ channelId: activeChannel.channelId });
-                } else {
-                    await interaction.reply({
-                        content: `❌ Você já possui um canal de pagamento ativo: <#${activeChannel.channelId}>.`,
-                        ephemeral: true,
-                    });
-                    return;
-                }
             }
 
             const modal = new ModalBuilder()
@@ -1099,16 +1465,16 @@ client.on('interactionCreate', async (interaction) => {
 
             const inputValor = new TextInputBuilder()
                 .setCustomId('valor')
-                .setLabel('Valor desejado (ex: 299)')
+                .setLabel('Valor desejado (ex: 100 ou 300)')
                 .setStyle(TextInputStyle.Short)
                 .setPlaceholder('Digite o valor em reais')
                 .setRequired(false);
 
             const inputCupom = new TextInputBuilder()
                 .setCustomId('cupom')
-                .setLabel('Cupom (opcional)')
+                .setLabel('Cupom / ID de Indicação (Opcional)')
                 .setStyle(TextInputStyle.Short)
-                .setPlaceholder('Digite o código do cupom ou deixe em branco')
+                .setPlaceholder('Digite um cupom ou o ID de quem te indicou')
                 .setRequired(false);
 
             const row1 = new ActionRowBuilder().addComponents(inputValor);
@@ -1121,7 +1487,7 @@ client.on('interactionCreate', async (interaction) => {
             try {
                 await interaction.reply({
                     content: '❌ Ocorreu um erro ao abrir o formulário de saldo.',
-                    ephemeral: true,
+                    flags: [MessageFlags.Ephemeral]
                 });
             } catch (replyErr) {
                 console.error('Erro ao responder interação de adicionar saldo:', replyErr);
@@ -1129,597 +1495,376 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
 
-    const newIndicationCoupons = ['SOUZASETE', 'MT', 'RNUNES', 'DG', 'GREENZADA', 'BLACKGG', 'COQUIN7', 'NIKEGREEN', 'THCARRILLO', 'GOMESCITY', 'ITZGOD'];
+    const newIndicationCoupons = ['SOUZASETE', 'MT', 'RNUNES', 'DG', 'GREENZADA', 'BLACKGG', 
+    'COQUIN7', 'NIKEGREEN', 'THCARRILLO', 'GOMESCITY', 'ITZGOD', 'CRUSHER', 
+    'VICENTE', 'VINNY10', 'DIONIS', 'ORIENTES', 'UBITA' ];
 
-    // Formulário de saldo enviado
-    if (interaction.isModalSubmit() && interaction.customId === 'formulario_saldo') {
-        await interaction.deferReply({ ephemeral: true }).catch(err => console.error('Erro ao deferir resposta:', err));
+// SUBSTITUA TODA A INTERAÇÃO 'formulario_saldo' POR ESTA
+if (interaction.isModalSubmit() && interaction.customId === 'formulario_saldo') {
+    await interaction.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(err => console.error('Erro ao deferir resposta:', err));
 
-        try {
-            const valor = interaction.fields.getTextInputValue('valor');
-            const cupom = interaction.fields.getTextInputValue('cupom')?.trim().toUpperCase();
+    try {
+        const valorInputStr = interaction.fields.getTextInputValue('valor');
+        const cupomInput = interaction.fields.getTextInputValue('cupom')?.trim();
+        const userId = interaction.user.id;
+        const guild = interaction.guild;
+        const member = await guild.members.fetch(userId).catch(() => null);
+        let isIndicationId = false;
 
-            if (!valor && !cupom) {
-                await interaction.editReply({
-                    content: '❌ Você deve fornecer um valor ou um cupom válido.',
-                    ephemeral: true,
-                });
-                return;
-            }
+        // A função de log permanece a mesma
+        const logCouponUsage = async (couponCode, title, description) => {
+            try {
+                const logCouponsChannel = await guild.channels.fetch(LOG_COUPONS_ID);
+                const embed = new EmbedBuilder()
+                    .setTitle(title).setDescription(description).setColor('#FFD700')
+                    .addFields(
+                        { name: '👤 Usuário', value: `\`${member.user.username} (ID: ${userId})\`` },
+                        { name: '🎫 Código Utilizado', value: `\`${couponCode}\`` }
+                    ).setTimestamp();
+                await logCouponsChannel.send({ embeds: [embed] });
+            } catch (err) { console.error(`Erro ao enviar log para LOG_COUPONS_ID:`, err); }
+        };
 
-            const guild = interaction.guild;
-            const userId = interaction.user.id;
-            const member = await guild.members.fetch(userId).catch(err => {
-                console.error(`Erro ao buscar membro ${userId}:`, err);
-                return null;
-            });
-            if (!member) {
-                await interaction.editReply({
-                    content: '❌ Usuário não encontrado no servidor. Contate o suporte.',
-                    ephemeral: true,
-                });
-                return;
-            }
-
-            let parsedValor = 0;
-            let isDiscountApplied = false;
-
-            // Verificar se um cupom foi fornecido
-            if (cupom) {
-                if (cupom === 'GHOST2DAYS') {
-                    const couponUsed = await couponUsage.findOne({ userId, coupon: 'GHOST2DAYS' });
+        if (cupomInput) {
+            const isNumericId = /^\d{17,20}$/.test(cupomInput);
+            if (isNumericId) {
+                if (cupomInput === userId) {
+                    await interaction.editReply({ content: '❌ Você não pode indicar a si mesmo.' });
+                    return;
+                }
+                const referrerMember = await guild.members.fetch(cupomInput).catch(() => null);
+                if (!referrerMember) {
+                    await interaction.editReply({ content: '❌ O ID de indicação fornecido não corresponde a um usuário válido neste servidor.' });
+                    return;
+                }
+                const referrerDoc = await registeredUsers.findOne({ userId: cupomInput });
+                if (!referrerDoc || !referrerDoc.paymentHistory || referrerDoc.paymentHistory.length === 0) {
+                    await interaction.editReply({ content: '❌ Este ID de indicação não é válido, pois o usuário ainda não é um assinante.' });
+                    return;
+                }
+                const currentUserDoc = await registeredUsers.findOne({ userId: userId });
+                if (currentUserDoc && currentUserDoc.paymentHistory && currentUserDoc.paymentHistory.length > 0) {
+                    await interaction.editReply({ content: '❌ Você não pode ser indicado, pois já é um assinante.' });
+                    return; // Impede o registro e o log
+                }
+                // VERIFICAÇÃO-CHAVE: Impede o registro duplicado.
+                const existingUser = await registeredUsers.findOne({ userId: userId });
+                if (existingUser && existingUser.referredBy) {
+                    const originalReferrer = await client.users.fetch(existingUser.referredBy).catch(() => null);
+                    const referrerTag = originalReferrer ? `<@${originalReferrer.id}>` : `o usuário com ID \`${existingUser.referredBy}\``;
+                    await interaction.editReply({ content: `❌ Você já foi indicado por ${referrerTag}. Não é possível alterar a indicação.` });
+                    return; // Para a execução, não salva e não gera log.
+                }
+                isIndicationId = true;
+                console.log(`[Indicação] Usuário ${userId} indicou o ID válido: ${cupomInput}`);
+            } else {
+                // Lógica antiga para cupons de texto
+                const cupomUpper = cupomInput.toUpperCase();
+                if (cupomUpper === 'CUPOM') {
+                    // (Sua lógica para o cupom 'CUPOM' continua a mesma)
+                    const couponUsed = await couponUsage.findOne({ userId, coupon: 'CUPOM' });
                     if (couponUsed) {
-                        await interaction.editReply({
-                            content: '❌ Você já utilizou o cupom GHOST2DAYS anteriormente.',
-                            ephemeral: true,
-                        });
+                        await interaction.editReply({ content: '❌ Você já utilizou o cupom CUPOM anteriormente.' });
                         return;
                     }
-
-                    const now = Date.now();
+                    const now = new Date();
                     let expirationDate;
                     const existingExpiration = await expirationDates.findOne({ userId });
-                    if (existingExpiration && new Date(existingExpiration.expirationDate) > new Date(now)) {
-                        const daysLeft = calculateDaysLeft(existingExpiration.expirationDate, now);
-                        console.log(`Usuário ${userId} tem ${daysLeft} dias restantes na assinatura atual. Adicionando 2 dias via cupom.`);
-                        const additionalDaysInMs = daysLeft * 24 * 60 * 60 * 1000;
-                        expirationDate = now + additionalDaysInMs + (2 * 24 * 60 * 60 * 1000);
+                    if (existingExpiration && new Date(existingExpiration.expirationDate) > now) {
+                        expirationDate = new Date(existingExpiration.expirationDate);
                     } else {
-                        expirationDate = now + (2 * 24 * 60 * 60 * 1000);
+                        expirationDate = new Date(now);
                     }
-                    console.log(`[${new Date(now).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}] Data de expiração definida para ${userId} via cupom: ${new Date(expirationDate).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}`);
-
-                    await expirationDates.updateOne(
-                        { userId },
-                        { $set: { expirationDate: expirationDate, createdAt: new Date(now) } },
-                        { upsert: true }
-                    );
-
-                    await couponUsage.insertOne({
-                        userId,
-                        coupon: 'GHOST2DAYS',
-                        usedAt: new Date(now),
-                    });
-
-                    const botMember = await guild.members.fetch(client.user.id);
-                    const botHighestRole = botMember.roles.highest;
-                    const vipRole = await guild.roles.fetch(VIP_ROLE_ID);
-                    const aguardandoRole = await guild.roles.fetch(AGUARDANDO_PAGAMENTO_ROLE_ID);
-
-                    let roleUpdateSuccess = false;
-                    if (botHighestRole.position > vipRole.position) {
-                        await member.roles.add(VIP_ROLE_ID).catch(err => console.error(`Erro ao adicionar VIP para ${userId}:`, err));
-                        await member.roles.remove(AGUARDANDO_PAGAMENTO_ROLE_ID).catch(err => console.error(`Erro ao remover AGUARDANDO_PAGAMENTO para ${userId}:`, err));
-                        roleUpdateSuccess = true;
-                    } else {
-                        console.error(`Bot não tem permissão para gerenciar VIP para ${userId} devido à hierarquia.`);
-                    }
-
-                    const logsCouponsChannel = await guild.channels.fetch(LOG_COUPONS_ID).catch(err => {
-                        console.error(`Erro ao buscar canal de cupons ${LOG_COUPONS_ID}:`, err);
-                        return null;
-                    });
-                    if (logsCouponsChannel) {
-                        const horario = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', hour12: false }).replace(', ', ' às ');
-                        const couponEmbed = new EmbedBuilder()
-                            .setTitle('🎟️ Cupom Utilizado')
-                            .setDescription(`O usuário <@${userId}> utilizou o cupom GHOST2DAYS.`)
-                            .addFields([
-                                { name: '👤 Usuário', value: `${member.user.tag}`, inline: false },
-                                { name: '🆔 ID', value: userId, inline: true },
-                                { name: '🕒 Horário', value: horario, inline: true },
-                                { name: '✅ Papéis Atualizados', value: roleUpdateSuccess ? 'Sim' : 'Não', inline: true },
-                            ])
-                            .setColor('#00FF00')
-                            .setTimestamp();
-                        await logsCouponsChannel.send({ embeds: [couponEmbed] });
-                    }
-
-                    await interaction.editReply({
-                        content: `✅ Cupom GHOST2DAYS aplicado com sucesso! Sua assinatura foi estendida por 2 dias.${roleUpdateSuccess ? '' : ' ⚠️ Porém, houve um erro ao atualizar seus papéis. Um administrador foi notificado.'}`,
-                        ephemeral: true,
-                    });
+                    expirationDate.setDate(expirationDate.getDate() + 2);
+                    await expirationDates.updateOne({ userId }, { $set: { expirationDate: expirationDate, createdAt: now } }, { upsert: true });
+                    await couponUsage.insertOne({ userId, coupon: 'CUPOM', usedAt: now });
+                    await logCouponUsage('CUPOM', '🎟️ Cupom de VIP Direto Utilizado', 'Um usuário ativou VIP por 2 dias com um cupom.');
+                    await interaction.editReply({ content: `✅ Cupom CUPOM aplicado com sucesso! Sua assinatura foi estendida por 2 dias.` });
                     return;
-                } else if (newIndicationCoupons.includes(cupom) || cupom === 'SONECA') {
-                    const couponUsed = await couponUsage.findOne({ userId, coupon: cupom });
-                    if (couponUsed) {
-                        await interaction.editReply({
-                            content: `❌ Você já utilizou o cupom ${cupom} anteriormente.`,
-                            ephemeral: true,
-                        });
-                        return;
-                    }
-
-                    if (valor) {
-                        // Verificar o valor fornecido com o cupom
-                        if (!/^\d+(\.\d{2})?$/.test(valor)) {
-                            await interaction.editReply({
-                                content: '❌ Por favor, insira um valor válido (ex: 299).',
-                                ephemeral: true,
-                            });
-                            return;
-                        }
-
-                        parsedValor = parseFloat(valor);
-                        if (parsedValor !== 99 && parsedValor < 299) {
-                            await interaction.editReply({
-                                content: '❌ Esse valor não é suficiente. R$99 para semanal (7 dias) ou R$299 para mensal (30 dias).',
-                                ephemeral: true,
-                            });
-                            return;
-                        }
-                        isDiscountApplied = true;
-                    } else {
-                        // Caso apenas o cupom seja fornecido, definir indicação sem criar canal PIX
-                        await registeredUsers.updateOne(
-                            { userId },
-                            { $set: { indication: cupom } },
-                            { upsert: true }
-                        );
-
-                        await couponUsage.insertOne({
-                            userId,
-                            coupon: cupom,
-                            usedAt: new Date(),
-                        });
-
-                        const logsCouponsChannel = await guild.channels.fetch(LOG_COUPONS_ID).catch(err => {
-                            console.error(`Erro ao buscar canal de cupons ${LOG_COUPONS_ID}:`, err);
-                            return null;
-                        });
-                        if (logsCouponsChannel) {
-                            const horario = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', hour12: false }).replace(', ', ' às ');
-                            const couponEmbed = new EmbedBuilder()
-                                .setTitle('🎟️ Cupom Utilizado')
-                                .setDescription(`O usuário <@${userId}> utilizou o cupom ${cupom} para definir indicação.`)
-                                .addFields([
-                                    { name: '👤 Usuário', value: `${member.user.tag}`, inline: false },
-                                    { name: '🆔 ID', value: userId, inline: true },
-                                    { name: '🕒 Horário', value: horario, inline: true },
-                                    { name: '📋 Indicação', value: cupom, inline: true },
-                                ])
-                                .setColor('#00FF00')
-                                .setTimestamp();
-                            await logsCouponsChannel.send({ embeds: [couponEmbed] });
-                        }
-
-                        await interaction.editReply({
-                            content: `✅ Cupom ${cupom} aplicado com sucesso! Sua indicação foi definida como "${cupom}".`,
-                            ephemeral: true,
-                        });
-                        return;
-                    }
+                } else if (newIndicationCoupons.includes(cupomUpper)) {
+                    await registeredUsers.updateOne({ userId }, { $set: { indication: cupomUpper } });
+                    await couponUsage.insertOne({ userId, coupon: cupomUpper, usedAt: new Date() });
+                    await logCouponUsage(cupomUpper, '🎟️ Cupom de Indicação (Texto) Aplicado', 'Um usuário utilizou um cupom de indicação em texto.');
+                    // Adicionamos a resposta ao usuário e o 'return' para parar a execução
+                    await interaction.editReply({ content: `✅ Cupom de indicação "${cupomUpper}" registrado com sucesso! Agora, para ativar sua assinatura, use o painel novamente e informe o valor do plano.` });
+                    return;
                 } else {
-                    await interaction.editReply({
-                        content: '❌ Cupom inválido. Use um cupom válido ou deixe em branco para pagamento PIX.',
-                        ephemeral: true,
-                    });
-                    return;
-                }
-            } else if (valor) {
-                // Caso apenas o valor seja fornecido (sem cupom)
-                if (!/^\d+(\.\d{2})?$/.test(valor)) {
-                    await interaction.editReply({
-                        content: '❌ Por favor, insira um valor válido (ex: 299).',
-                        ephemeral: true,
-                    });
-                    return;
-                }
-
-                parsedValor = parseFloat(valor);
-                if (parsedValor !== 99 && parsedValor < 299) {
-                    await interaction.editReply({
-                        content: '❌ Esse valor não é suficiente. R$99 para semanal (7 dias) ou R$299 para mensal (30 dias).',
-                        ephemeral: true,
-                    });
+                    await interaction.editReply({ content: '❌ Cupom ou ID de Indicação inválido.' });
                     return;
                 }
             }
+        }
+        if (!valorInputStr && isIndicationId) {
+            await registeredUsers.updateOne({ userId }, { $set: { referredBy: cupomInput } });
+            await logCouponUsage(cupomInput, '🎟️ ID de Indicação Registrado', `O usuário ${member.user.username} registrou ter sido indicado por ${cupomInput}.`);
+            await interaction.editReply({ content: `✅ Entendido! Registramos que você foi indicado por <@${cupomInput}>. Agora, para ativar sua assinatura, use o painel novamente e informe o valor do plano.` });
+            return;
+        }
 
-            // Criar canal PIX se um valor válido foi fornecido
-            const nomeCanal = `pix-${interaction.user.username.toLowerCase()}`;
-            const canalExistente = guild.channels.cache.find(ch => ch.name === nomeCanal);
+        const valorInput = parseFloat(valorInputStr);
+        if (isNaN(valorInput) || valorInput <= 0) {
+            await interaction.editReply({ content: '❌ Por favor, insira um valor numérico válido e positivo.' });
+            return;
+        }
 
-            if (canalExistente) {
-                await interaction.editReply({
-                    content: `📌 Você já possui um canal de pagamento: ${canalExistente}.`,
-                    ephemeral: true,
-                });
-                return;
+        // --- INÍCIO DA LÓGICA DE VALIDAÇÃO DE VALOR ---
+        const planoSemanal = 100;
+        const planoMensal = 300;
+        let valorFinalAPagar = 0;
+        let saldoUtilizado = 0;
+        let duration = 0;
+
+        const balanceDoc = await userBalances.findOne({ userId });
+        const saldoDisponivel = balanceDoc ? balanceDoc.balance : 0;
+        const valorMensalComDesconto = Math.max(1, planoMensal - saldoDisponivel);
+
+        // A ordem das verificações foi ajustada para evitar conflitos
+        if (saldoDisponivel > 0 && valorInput === valorMensalComDesconto) {
+            // 1º VERIFICA O PAGAMENTO COM DESCONTO
+            valorFinalAPagar = valorMensalComDesconto;
+            saldoUtilizado = planoMensal - valorFinalAPagar;
+            duration = 30;
+        } else if (valorInput === planoMensal) {
+            // 2º VERIFICA O PAGAMENTO MENSAL CHEIO
+            valorFinalAPagar = planoMensal;
+            saldoUtilizado = 0;
+            duration = 30;
+        } else if (valorInput === planoSemanal) {
+            // 3º VERIFICA O PAGAMENTO SEMANAL
+            valorFinalAPagar = planoSemanal;
+            saldoUtilizado = 0;
+            duration = 7;
+        } else {
+            // SE NENHUMA CONDIÇÃO FOR ATENDIDA, O VALOR É INVÁLIDO
+            let errorMessage = `❌ Valor inválido de R$ ${valorInput.toFixed(2)}.\n\nAs opções de pagamento são:\n- **R$ ${planoSemanal.toFixed(2)}** (Plano Semanal)\n- **R$ ${planoMensal.toFixed(2)}** (Plano Mensal)`;
+            if (saldoDisponivel > 0) {
+                errorMessage += `\n- **R$ ${valorMensalComDesconto.toFixed(2)}** (Plano Mensal com seu desconto)`;
             }
-
-            const duration = parsedValor === 99 ? 7 : 30;
-
-            const canalPix = await guild.channels.create({
-                name: nomeCanal,
+            await interaction.editReply({ content: errorMessage });
+            return;
+        }
+        // --- FIM DA LÓGICA DE VALIDAÇÃO DE VALOR ---
+        console.log('[Debug] 6. Validação de valor concluída. Editando resposta para "Gerando pagamento"...');
+        await interaction.editReply({ content: '⏳ Gerando seu pagamento, por favor aguarde...' });
+        console.log('[Debug] 7. Resposta editada. Iniciando criação do canal de pagamento...');
+        
+        if (isIndicationId) {
+            await registeredUsers.updateOne({ userId }, { $set: { referredBy: cupomInput } });
+            await logCouponUsage(cupomInput, '🎟️ ID de Indicação Aplicado com Pagamento', `O usuário ${member.user.username} iniciou um pagamento e informou ter sido indicado por ${cupomInput}.`);
+        }
+        
+        let target; 
+        let paymentChannel; 
+        try {
+            const botMember = await guild.members.fetch(client.user.id);
+            const category = await guild.channels.fetch(CATEGORIA_PAGAMENTOS_ID);
+            if (!category || category.type !== ChannelType.GuildCategory) throw new Error(`Categoria de pagamentos (ID: ${CATEGORIA_PAGAMENTOS_ID}) não encontrada.`);
+            
+            const botPermissions = category.permissionsFor(botMember);
+            if (!botPermissions.has(PermissionsBitField.Flags.ManageChannels)) throw new Error('O bot não tem permissão para criar canais na categoria.');
+            
+            const createChannelPromise = guild.channels.create({
+                name: `pix-${interaction.user.username.replace(/[^a-zA-Z0-9-]/g, '').substring(0, 20)}`,
                 type: ChannelType.GuildText,
                 parent: CATEGORIA_PAGAMENTOS_ID,
                 permissionOverwrites: [
                     { id: guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
-                    { id: userId, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles] },
-                    { id: client.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.ReadMessageHistory] },
+                    { id: userId, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] },
+                    { id: client.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageChannels] },
                 ],
             });
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout de 20s atingido.')), 20000));
+            
+            paymentChannel = await Promise.race([createChannelPromise, timeoutPromise]);
+            target = paymentChannel;
+            
+            await activePixChannels.updateOne({ userId: userId }, { $set: { channelId: paymentChannel.id, createdAt: new Date() } }, { upsert: true });
+            await interaction.editReply({ content: `✅ Seu canal de pagamento foi criado: ${paymentChannel}` });
 
-            const embedPix = new EmbedBuilder()
-                .setTitle('💳 Pagamento via PIX - Adicionar Saldo')
-                .setDescription(
-                    'Faça o pagamento usando os dados abaixo e envie o comprovante PIX (IMAGEM) neste canal.\n' +
-                    '⚠️ **Você tem 24 horas para confirmar o pagamento.**'
-                )
-                .addFields([
-                    { name: '💰 Valor', value: `R$${parsedValor.toFixed(2)}`, inline: true },
-                    { name: '🕓 Validade', value: '24h', inline: true },
-                    { name: 'Chave PIX', value: PIX_DATA.chave, inline: false },
-                    { name: 'Nome', value: PIX_DATA.nome, inline: true },
-                    { name: 'Instruções', value: '1. Copie a chave PIX\n2. Abra seu app de banco\n3. Pague com PIX\n4. Envie o comprovante (IMAGEM) aqui', inline: false },
-                    ...(isDiscountApplied ? [{ name: '🎟️ Cupom', value: cupom, inline: true }] : []),
-                    { name: '📅 Duração', value: `${duration} dias`, inline: true },
-                ])
-                .setColor('#00FF99');
+        } catch (channelError) {
+            console.warn(`[AVISO] Falha ao criar canal de pagamento (${channelError.message}). Ativando fallback para DM.`);
+            target = interaction.user; 
+            await interaction.editReply({ content: '⚠️ A criação do canal falhou. Tentando enviar as informações por Mensagem Direta (DM)...' });
+        }
 
-            const botaoCopiarPix = new ButtonBuilder()
-                .setCustomId('copiar_chave_pix')
-                .setLabel('Copiar Chave PIX')
-                .setEmoji('📋')
-                .setStyle(ButtonStyle.Primary);
+        try {
+            // A chamada agora usa as variáveis validadas
+            console.log('[Debug] 8. Canal de pagamento definido. Chamando a API do Mercado Pago...');
+            const paymentInfo = await createMercadoPagoPayment(userId, valorFinalAPagar, duration, saldoUtilizado);
+            console.log('[Debug] 9. Resposta da API do Mercado Pago recebida com sucesso.');
+            
+            const qrCodeBuffer = Buffer.from(paymentInfo.qrCodeBase64, 'base64');
+            const attachment = new AttachmentBuilder(qrCodeBuffer, { name: 'qrcode.png' });
+            const embedPagamento = new EmbedBuilder()
+                .setTitle('💳 Pagamento PIX Automatizado')
+                .setDescription('Sua fatura foi gerada! Pague usando o QR Code ou o código abaixo.\n\n✅ **Sua assinatura será ativada automaticamente.**')
+                .addFields(
+                    { name: '💰 Valor', value: `R$${valorFinalAPagar.toFixed(2)}`, inline: true },
+                    { name: '🕒 Validade da Fatura', value: '10 minutos', inline: true },
+                    { name: '📝 Código PIX (Copia e Cola)', value: `\`\`\`${paymentInfo.copiaECola}\`\`\`` }
+                ).setImage('attachment://qrcode.png').setColor('#00FF99').setFooter({ text: 'Não é necessário enviar comprovante.' });
+            
+            const rowPagamento = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('copiar_pix').setLabel('Copiar Código PIX').setStyle(ButtonStyle.Secondary).setEmoji('📋'));
+        
+            await target.send({ content: `<@${userId}>, seu pagamento foi gerado!`, embeds: [embedPagamento], files: [attachment], components: [rowPagamento] });
 
-            const botaoConfirmar = new ButtonBuilder()
-                .setCustomId('confirmar_pagamento')
-                .setLabel('Confirmar Pagamento')
-                .setStyle(ButtonStyle.Success)
-                .setEmoji('✅');
-
-            const row = new ActionRowBuilder().addComponents(botaoCopiarPix, botaoConfirmar);
-
-            const message = await canalPix.send({
-                content: `<@${userId}>`,
-                embeds: [embedPix],
-                components: [row],
-            });
-
-            await paymentValues.insertOne({
-                channelId: canalPix.id,
-                userId: userId,
-                value: parsedValor.toString(),
-                createdAt: new Date(),
-                ...(isDiscountApplied ? { coupon: cupom } : {}),
-            });
-
-            await activePixChannels.insertOne({
-                userId: userId,
-                channelId: canalPix.id,
-                createdAt: new Date(),
-            });
-
-            // Registrar o cupom de indicação, se aplicável
-            if (isDiscountApplied) {
-                await registeredUsers.updateOne(
-                    { userId },
-                    { $set: { indication: cupom } },
-                    { upsert: true }
-                );
-
-                await couponUsage.insertOne({
-                    userId,
-                    coupon: cupom,
-                    usedAt: new Date(),
-                });
-
-                const logsCouponsChannel = await guild.channels.fetch(LOG_COUPONS_ID).catch(err => {
-                    console.error(`Erro ao buscar canal de cupons ${LOG_COUPONS_ID}:`, err);
-                    return null;
-                });
-                if (logsCouponsChannel) {
-                    const horario = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', hour12: false }).replace(', ', ' às ');
-                    const couponEmbed = new EmbedBuilder()
-                        .setTitle('🎟️ Cupom Utilizado')
-                        .setDescription(`O usuário <@${userId}> utilizou o cupom ${cupom} de indicação.`)
-                        .addFields([
-                            { name: '👤 Usuário', value: `${member.user.tag}`, inline: false },
-                            { name: '🆔 ID', value: userId, inline: true },
-                            { name: '🕒 Horário', value: horario, inline: true },
-                            { name: '📋 Indicação', value: cupom, inline: true },
-                            { name: '💰 Valor', value: `R$${parsedValor.toFixed(2)}`, inline: true },
-                        ])
-                        .setColor('#00FF00')
-                        .setTimestamp();
-                    await logsCouponsChannel.send({ embeds: [couponEmbed] });
-                }
+            if (target !== interaction.user && paymentChannel) {
+                setTimeout(async () => {
+                    try {
+                        if (guild.channels.cache.has(paymentChannel.id)) {
+                            await paymentChannel.delete('Tempo de pagamento expirado.');
+                        }
+                    } catch(err) { console.error(`Erro ao deletar o canal ${paymentChannel.name}:`, err); }
+                    await activePixChannels.deleteOne({ userId: userId });
+                }, 10 * 60 * 1000); 
+            } else if (target === interaction.user) {
+                // Se o alvo for DM, a resposta inicial já foi editada, podemos só confirmar.
+                // Opcional: pode-se usar followUp se a resposta inicial precisar ser mantida.
             }
 
-            setTimeout(async () => {
-                try {
-                    const channel = await guild.channels.fetch(canalPix.id).catch(() => null);
-                    if (channel) {
-                        await channel.delete('Timeout de 24 horas atingido');
-                    }
-                    await activePixChannels.deleteOne({ userId: userId });
-                    await paymentValues.deleteOne({ channelId: canalPix.id });
-                } catch (err) {
-                    console.error('Erro ao deletar canal PIX após 24h:', err);
-                }
-            }, 24 * 60 * 60 * 1000); // 24 horas
+        } catch (err) { 
+            console.error('Erro ao gerar pagamento ou enviar mensagem (principal/fallback):', err);
+            let finalErrorMessage = '❌ Ocorreu um erro grave ao gerar seu pagamento. Contate o suporte.';
+            if (err.code === 50007) { 
+                finalErrorMessage = '❌ Falha ao enviar DM. Verifique se suas Mensagens Diretas estão abertas para este servidor e tente novamente.'
+            }
+            await interaction.editReply({ content: finalErrorMessage });
+        }
 
-            await interaction.editReply({
-                content: `✅ Seu canal de pagamento foi criado: ${canalPix}.${isDiscountApplied ? ` Cupom ${cupom} de indicação aplicado: R$${parsedValor.toFixed(2)}.` : ''}`,
-                ephemeral: true,
-            });
-        } catch (err) {
-            console.error('Erro na criação do canal de pagamento:', err);
-            await interaction.editReply({
-                content: '❌ Ocorreu um erro ao criar o canal de pagamento.',
-                ephemeral: true,
-            }).catch(replyErr => console.error('Erro ao editar resposta:', replyErr));
+    } catch (err) {
+        console.error('Erro geral no handler formulario_saldo:', err);
+        if (!interaction.replied && !interaction.deferred) {
+            await interaction.editReply({ content: '❌ Ocorreu um erro inesperado.' }).catch(() => {});
         }
     }
+}
+// Botão de copiar PIX
+if (interaction.isButton() && interaction.customId === 'copiar_pix') {
+    try {
+        const originalMessage = interaction.message;
+        if (!originalMessage || !originalMessage.embeds || originalMessage.embeds.length === 0) {
+            return await interaction.reply({
+                content: '❌ Não foi possível encontrar a mensagem original com o código PIX.',
+            });
+        }
 
-    // Botão de copiar chave PIX
-    if (interaction.isButton() && interaction.customId === 'copiar_chave_pix') {
+        const embed = originalMessage.embeds[0];
+        const pixField = embed.fields.find(field => field.name.includes('Código PIX'));
+        
+        if (!pixField || !pixField.value) {
+            return await interaction.reply({
+                content: '❌ Não foi possível extrair o código PIX da mensagem.',
+            });
+        }
+
+        // Remove os ``` do início e do fim do código
+        const pixCode = pixField.value.replace(/```/g, '').trim();
+
+        // Responde de forma efêmera (só o usuário vê) com o código para facilitar a cópia
+        await interaction.reply({
+            content: pixCode,
+            flags: [MessageFlags.Ephemeral]
+        });
+
+    } catch (err) {
+        console.error('Erro ao processar o botão copiar_pix:', err);
         try {
             await interaction.reply({
-                content: `📋 Chave PIX: **${PIX_DATA.chave}**`,
-                ephemeral: true,
+                content: '❌ Ocorreu um erro ao tentar copiar o código PIX.',
             });
-        } catch (err) {
-            console.error('Erro ao responder interação de copiar chave PIX:', err);
+        } catch (replyErr) {
+            console.error('Erro ao responder interação de copiar_pix:', replyErr);
         }
     }
-
-    // Confirmação de pagamento
-    if (interaction.isButton() && interaction.customId === 'confirmar_pagamento') {
-        await interaction.deferReply({ ephemeral: true }).catch(err => console.error('Erro ao deferir resposta:', err));
-
-        try {
-            const userId = interaction.message.content.match(/<@(\d+)>/)[1];
-            console.log(`Iniciando confirmação de pagamento para userId: ${userId}`);
-            if (interaction.user.id !== userId) {
-                await interaction.editReply({
-                    content: '❌ Apenas o usuário que criou este canal pode confirmar.',
-                    ephemeral: true,
-                });
-                return;
-            }
-
-            const member = await interaction.guild.members.fetch(userId).catch(err => {
-                console.error(`Erro ao buscar membro ${userId}:`, err);
-                return null;
-            });
-            if (!member) {
-                console.warn(`Usuário ${userId} não encontrado no servidor. Ação abortada.`);
-                await interaction.editReply({
-                    content: '❌ Usuário não encontrado no servidor. Contate o suporte.',
-                    ephemeral: true,
-                });
-                return;
-            }
-
-            const canalPix = interaction.channel;
-            const botMember = await interaction.guild.members.fetch(client.user.id);
-            const botHighestRole = botMember.roles.highest;
-            const vipRole = await interaction.guild.roles.fetch(VIP_ROLE_ID);
-
-            if (botHighestRole.position <= vipRole.position) {
-                throw new Error('Bot não tem permissão suficiente para atribuir o cargo VIP devido à hierarquia de papéis.');
-            }
-
-            const valorRecord = await paymentValues.findOne({ channelId: canalPix.id });
-            if (!valorRecord) {
-                await interaction.editReply({
-                    content: '❌ Nenhum registro de pagamento encontrado. Contate o suporte.',
-                    ephemeral: true,
-                });
-                return;
-            }
-
-            const mensagens = await canalPix.messages.fetch({ limit: 100 });
-            const comprovante = mensagens.find(m =>
-                m.author.id === userId &&
-                m.attachments.size > 0 &&
-                m.attachments.first().contentType.startsWith('image/')
-            );
-            if (!comprovante) {
-                await interaction.editReply({
-                    content: '❌ Envie o comprovante PIX (imagem) antes de confirmar.',
-                    ephemeral: true,
-                });
-                return;
-            }
-            console.log(`Comprovante encontrado para userId ${userId}`);
-
-            const valor = parseFloat(valorRecord.value);
-            console.log(`Valor do pagamento: R$${valor}`);
-
-            let userBalance = await userBalances.findOne({ userId: userId });
-            if (!userBalance) {
-                await userBalances.insertOne({ userId: userId, balance: 0 });
-                userBalance = { balance: 0 };
-            }
-            await userBalances.updateOne(
-                { userId: userId },
-                { $set: { balance: userBalance.balance + valor } },
-                { upsert: true }
-            );
-            console.log(`Saldo atualizado para ${userId}: R$${(userBalance.balance + valor).toFixed(2)}`);
-
-            await registeredUsers.updateOne(
-                { userId: userId },
-                { $push: { paymentHistory: { amount: valor, timestamp: new Date(), reference: '11309256170' } } },
-                { upsert: true }
-            );
-            console.log(`Histórico de pagamento atualizado para ${userId}`);
-
-            let roleUpdateSuccess = false;
-            try {
-                await member.roles.add(VIP_ROLE_ID).catch(err => console.error(`Erro ao adicionar VIP para ${userId}:`, err));
-                await member.roles.remove(AGUARDANDO_PAGAMENTO_ROLE_ID).catch(err => console.error(`Erro ao remover AGUARDANDO_PAGAMENTO para ${userId}:`, err));
-                roleUpdateSuccess = true;
-            } catch (roleError) {
-                console.error(`Erro ao atualizar papéis para ${userId}:`, roleError);
-                const logChannel = await interaction.guild.channels.fetch(LOGS_BOTS_ID);
-                if (logChannel) {
-                    const errorEmbed = new EmbedBuilder()
-                        .setTitle('⚠️ Erro ao Atualizar Papéis')
-                        .setDescription(`Falha ao atualizar papéis para <@${userId}> após pagamento.`)
-                        .addFields([
-                            { name: 'Usuário', value: `${member.user.tag} (ID: ${userId})`, inline: false },
-                            { name: 'Erro', value: roleError.message, inline: false },
-                        ])
-                        .setColor('#FF0000')
-                        .setTimestamp();
-                    await logChannel.send({ embeds: [errorEmbed], content: `<@${ADMIN_USER_ID}>` });
-                }
-            }
-
-            const embedConfirmado = new EmbedBuilder()
-                .setTitle('✅ Pagamento Confirmado')
-                .setDescription(`O pagamento de <@${userId}> foi confirmado com sucesso!\nComprovante: [Ver Imagem](${comprovante.attachments.first().url})`)
-                .setColor('#00FF00');
-
-            await interaction.message.edit({
-                embeds: [embedConfirmado],
-                components: [],
-            });
-            console.log(`Mensagem de canal atualizada para ${userId}`);
-
-            await interaction.editReply({
-                content: `✅ Pagamento confirmado. Novo saldo: R$${(userBalance.balance + valor).toFixed(2)}.${roleUpdateSuccess ? '' : ' ⚠️ Porém, houve um erro ao atualizar seus papéis. Um administrador foi notificado.'}`,
-                ephemeral: true,
-            });
-            console.log(`Resposta enviada ao usuário ${userId}`);
-
-            const logChannel = await interaction.guild.channels.fetch(LOG_PAGAMENTOS_ID);
-            if (logChannel) {
-                const horario = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', hour12: false }).replace(', ', ' às ');
-                const logEmbed = new EmbedBuilder()
-                    .setTitle('💰 Pagamento Aprovado')
-                    .setDescription('Um novo pagamento foi aprovado!')
-                    .addFields([
-                        { name: '👤 Usuário', value: `${member.user.tag} (ID: ${userId})`, inline: false },
-                        { name: '💸 Valor', value: `R$${valor}`, inline: true },
-                        { name: '📝 Referência', value: '11309256170', inline: true },
-                        { name: '🕒 Horário', value: horario, inline: false },
-                    ])
-                    .setColor('#00FF00')
-                    .setTimestamp();
-                await logChannel.send({ embeds: [logEmbed] });
-                await paymentValues.deleteOne({ channelId: canalPix.id });
-                console.log(`Log de pagamento enviado e registro deletado para ${userId}`);
-            }
-
-            const logsBotsChannel = await interaction.guild.channels.fetch(LOGS_BOTS_ID);
-            if (logsBotsChannel) {
-                const horario = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', hour12: false }).replace(', ', ' às ');
-                const renewEmbed = new EmbedBuilder()
-                    .setTitle('🔄 Assinatura Renovada')
-                    .setDescription('A assinatura de um usuário foi renovada!')
-                    .addFields([
-                        { name: '👤 Usuário', value: `${member.user.tag}`, inline: false },
-                        { name: '🆔 ID', value: userId, inline: true },
-                        { name: '🕒 Horário', value: horario, inline: true },
-                        { name: '✅ Papéis Atualizados', value: roleUpdateSuccess ? 'Sim' : 'Não', inline: true },
-                    ])
-                    .setColor(roleUpdateSuccess ? '#00FF00' : '#FFA500')
-                    .setTimestamp();
-                await logsBotsChannel.send({ embeds: [renewEmbed] });
-                console.log(`Log de renovação enviado para ${userId}`);
-            }
-
-            await activePixChannels.deleteOne({ userId: userId });
-            console.log(`Canal ativo deletado para ${userId}`);
-
-            if (roleUpdateSuccess) {
-                const now = Date.now();
-                let expirationDate;
-                const existingExpiration = await expirationDates.findOne({ userId: userId });
-                const duration = valor === 99 ? 7 : 30; // 7 days for R$99, 30 days for R$299 or higher
-                if (existingExpiration && new Date(existingExpiration.expirationDate) > new Date(now)) {
-                    const daysLeft = calculateDaysLeft(existingExpiration.expirationDate, now);
-                    console.log(`Usuário ${userId} tem ${daysLeft} dias restantes na assinatura atual.`);
-                    const additionalDaysInMs = daysLeft * 24 * 60 * 60 * 1000;
-                    expirationDate = now + additionalDaysInMs + (duration * 24 * 60 * 60 * 1000);
-                } else {
-                    expirationDate = now + (duration * 24 * 60 * 60 * 1000);
-                }
-                console.log(`[${new Date(now).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}] Data de expiração definida para ${userId}: ${new Date(expirationDate).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}`);
-
-                await expirationDates.updateOne(
-                    { userId: userId },
-                    { $set: { expirationDate: expirationDate, createdAt: new Date(now) } },
-                    { upsert: true }
-                );
-            }
-        } catch (err) {
-            console.error(`Erro ao confirmar pagamento para ${userId}:`, err);
-            await interaction.editReply({
-                content: `❌ Ocorreu um erro ao confirmar o pagamento: ${err.message}. Contate o administrador se o problema persistir.`,
-                ephemeral: true,
-            }).catch(replyErr => console.error('Erro ao editar resposta:', replyErr));
-        }
-    }
+}
 
     // Botão consultar saldo
     if (interaction.isButton() && interaction.customId === 'consultar_saldo') {
         try {
-            const userExists = await registeredUsers.findOne({ userId: interaction.user.id });
-            if (!userExists) {
+            const userId = interaction.user.id;
+            const userDoc = await registeredUsers.findOne({ userId });
+            if (!userDoc) {
                 await interaction.reply({
-                    content: '❌ Você precisa se registrar antes de consultar o saldo.',
-                    ephemeral: true,
+                    content: '❌ Você precisa se registrar antes de fazer uma consulta. Vá para #registrar-se.',
+                    flags: [MessageFlags.Ephemeral]
                 });
                 return;
             }
+    
+            // --- NOVA LÓGICA ---
+            // Buscar o saldo de bônus
+            const balanceDoc = await userBalances.findOne({ userId });
+            const bonusBalance = balanceDoc ? balanceDoc.balance : 0;
+    
+            // Buscar a data de expiração
+            const expirationRecord = await expirationDates.findOne({ userId });
 
-            const userBalance = await userBalances.findOne({ userId: interaction.user.id }) || { balance: 0 };
-            console.log(`Consulta de saldo para ${interaction.user.id}: ${userBalance.balance}`);
-
-            const expirationRecord = await expirationDates.findOne({ userId: interaction.user.id });
-            let expirationMessage = '';
-            if (expirationRecord) {
-                const now = Date.now();
-                const daysLeft = calculateDaysLeft(expirationRecord.expirationDate, now);
-                console.log(`[${new Date(now).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}] Consultar Saldo - Usuário ${interaction.user.id}: Expiração em ${new Date(expirationRecord.expirationDate).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}, ${daysLeft} dias restantes`);
-                expirationMessage = `\nSua assinatura VIP expira em ${daysLeft} dias.`;
+            let lastPaymentInfo = 'Nenhum pagamento registrado';
+            // Verifica se o histórico de pagamentos existe e não está vazio
+            if (userDoc.paymentHistory && userDoc.paymentHistory.length > 0) {
+                // Pega o último item do array
+                const lastPayment = userDoc.paymentHistory[userDoc.paymentHistory.length - 1];
+                // Formata a data e o valor
+                const paymentDate = new Date(lastPayment.timestamp).toLocaleDateString('pt-BR', {
+                    day: '2-digit',
+                    month: '2-digit',
+                    year: 'numeric'
+                });
+                const paymentAmount = Number(lastPayment.amount).toFixed(2);
+                lastPaymentInfo = `R$ ${paymentAmount} em ${paymentDate}`;
             }
+            
+            const embed = new EmbedBuilder()
+                .setTitle('🔍 Consulta de Conta')
+                .setColor('#00BFFF')
+                .setAuthor({ name: interaction.user.username, iconURL: interaction.user.displayAvatarURL() });
+    
+            // Adiciona o campo de Saldo de Bônus
+            embed.addFields({ name: '💰 Saldo de Bônus', value: `**R$ ${bonusBalance.toFixed(2)}**` });
+            embed.addFields({ name: '💳 Último Pagamento', value: lastPaymentInfo });
 
+            // Adiciona informações da assinatura, se existir
+            if (expirationRecord && expirationRecord.expirationDate) {
+                const now = new Date();
+                const daysLeft = calculateDaysLeft(expirationRecord.expirationDate, now);
+                const daysMessage = daysLeft > 0 ? `${daysLeft} dias restantes` : 'Expirada';
+                
+                embed.addFields(
+                    { name: '✅ Status da Assinatura', value: 'Ativa', inline: true },
+                    { name: '🗓️ Expira em', value: daysMessage, inline: true }
+                );
+            } else {
+                embed.addFields({ name: '❌ Status da Assinatura', value: 'Inativa' });
+                embed.setDescription('Você não possui uma assinatura VIP ativa no momento.');
+            }
+    
             await interaction.reply({
-                content: `✅ Seu saldo atual é: R$${userBalance.balance.toFixed(2)}.${expirationMessage}`,
-                ephemeral: true,
+                embeds: [embed],
+                flags: [MessageFlags.Ephemeral]
             });
+    
         } catch (err) {
             console.error('Erro ao consultar saldo:', err);
             try {
                 await interaction.reply({
-                    content: '❌ Ocorreu um erro ao consultar o saldo.',
-                    ephemeral: true,
+                    content: '❌ Ocorreu um erro ao realizar a consulta.',
+                    flags: [MessageFlags.Ephemeral]
                 });
             } catch (replyErr) {
                 console.error('Erro ao responder interação de consultar saldo:', replyErr);
             }
         }
     }
+    });
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, async () => {
+    console.log(`[API] Servidor rodando na porta ${PORT}`);
+    try {
+        await initializeCollections();
+        await client.login(process.env.DISCORD_TOKEN);
+    } catch (error) {
+        console.error("Erro fatal durante a inicialização:", error);
+        process.exit(1);
+    }
 });
-
-initializeCollections().catch(console.error);
-
-client.login(process.env.DISCORD_TOKEN);
